@@ -37,6 +37,6 @@ def generate_subtitles_only(video_path, model_size='medium'):
 # Uruchomienie
 if __name__ == "__main__":
     # Wpisz nazwę swojego pliku wideo
-    MOJE_WIDEO = "WorldOfTanks_replay_2025.11.11-22.58.mp4" 
+    MOJE_WIDEO = "videos/WorldOfTanks_replay_2025.11.11-22.58.mp4"
     
     generate_subtitles_only(MOJE_WIDEO, model_size='medium')
