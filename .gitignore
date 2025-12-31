@@ -1,9 +1,7 @@
 videos/
 WorldOfTanks_replay_2025.11.11-22.58.mp4
 WorldOfTanks_replay_2025.11.11-22.58.srt
-temp_audio_for_ai.wav
-model_onnx
-model_onnx_medium
+/nagrania
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

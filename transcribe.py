@@ -1,20 +1,18 @@
 import os
 import time
-import subprocess
-from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
-from transformers import AutoProcessor, pipeline
+from faster_whisper import WhisperModel
 from datetime import timedelta
 
-def extract_audio_to_wav(video_path):
-    output_wav = "temp_audio_medium.wav"
-    cmd = f'ffmpeg -i "{video_path}" -ar 16000 -ac 1 -c:a pcm_s16le "{output_wav}" -y -loglevel error'
-    print(f"🎬 Ekstrakcja audio...")
-    try:
-        subprocess.run(cmd, shell=True, check=True)
-        return output_wav
-    except:
-        print("❌ Błąd FFmpeg")
-        return None
+# ================= KONFIGURACJA =================
+# Nazwa folderu, w którym trzymasz pliki do przerobienia
+FOLDER_WEJSCIOWY = "nagrania" 
+
+# Jakie formaty ma łapać program?
+ROZSZERZENIA = ('.mp3', '.wav', '.mp4', '.m4a', '.flac', '.mov', '.mkv', '.avi', '.wma', '.aac')
+
+# Model: 'large-v2' (dokładny) lub 'medium' (szybki)
+MODEL_SIZE = "large-v2"
+# ================================================
 
 def format_timestamp(seconds):
     td = timedelta(seconds=seconds)
@@ -25,58 +23,70 @@ def format_timestamp(seconds):
     millis = int(td.microseconds / 1000)
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
-def generate_srt(result, output_file):
-    with open(output_file, "w", encoding="utf-8") as f:
-        for i, chunk in enumerate(result["chunks"], start=1):
-            start, end = chunk["timestamp"]
-            if end is None: end = start + 2.0
-            text = chunk["text"].strip()
-            f.write(f"{i}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n\n")
-
-def run_gpu_medium(video_path):
-    # Zmieniona ścieżka na folder z modelem MEDIUM
-    local_model_path = "model_onnx_medium"
-    
-    if not os.path.exists(local_model_path):
-        print("❌ Nie znaleziono folderu 'model_onnx_medium'. Uruchom export_medium.py!")
+def process_folder():
+    # 1. Sprawdzamy czy folder istnieje
+    if not os.path.exists(FOLDER_WEJSCIOWY):
+        os.makedirs(FOLDER_WEJSCIOWY)
+        print(f"📁 Stworzono folder '{FOLDER_WEJSCIOWY}'. Wrzuć tam pliki i uruchom program ponownie!")
         return
 
-    audio_path = extract_audio_to_wav(video_path)
-    if not audio_path: return
+    # 2. Szukamy plików
+    pliki = [f for f in os.listdir(FOLDER_WEJSCIOWY) if f.lower().endswith(ROZSZERZENIA)]
+    
+    if not pliki:
+        print(f"❌ Pusto w folderze '{FOLDER_WEJSCIOWY}'. Wrzuć jakieś mp3/mp4/wav.")
+        return
 
-    print(f"--- START NA AMD (MEDIUM): {video_path} ---")
+    print(f"📂 Znaleziono {len(pliki)} plików do przetworzenia.")
+    print(f"🚀 Ładowanie modelu {MODEL_SIZE} (INT8)... (Tylko raz)")
     
     try:
-        model = ORTModelForSpeechSeq2Seq.from_pretrained(
-            local_model_path, 
-            provider="DmlExecutionProvider"
-        )
-        processor = AutoProcessor.from_pretrained(local_model_path)
+        # Ładujemy model przed pętlą, żeby nie tracić czasu przy każdym pliku
+        model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
     except Exception as e:
-        print(f"❌ Błąd: {e}")
+        print(f"❌ Błąd ładowania modelu: {e}")
         return
 
-    print("2. Transkrypcja...")
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        return_timestamps=True,
-        chunk_length_s=30,
-        stride_length_s=[6, 0]
-    )
+    # 3. Pętla po plikach
+    for i, plik in enumerate(pliki, 1):
+        pelna_sciezka = os.path.join(FOLDER_WEJSCIOWY, plik)
+        srt_sciezka = os.path.join(FOLDER_WEJSCIOWY, os.path.splitext(plik)[0] + ".srt")
+        
+        # Sprawdzamy, czy napisów już nie ma (żeby nie robić 2 razy tego samego)
+        if os.path.exists(srt_sciezka):
+            print(f"⏭️  Pominięto: {plik} (plik .srt już istnieje)")
+            continue
 
-    start_time = time.time()
-    result = pipe(audio_path, generate_kwargs={"language": "polish"})
-    end_time = time.time()
+        print(f"\n[{i}/{len(pliki)}] 🎙️  Przetwarzanie: {plik} ...")
+        start_time = time.time()
+        
+        try:
+            # Transkrypcja
+            segments, info = model.transcribe(pelna_sciezka, beam_size=5, language="pl", vad_filter=True)
+            
+            # Zapis do pliku
+            with open(srt_sciezka, "w", encoding="utf-8") as f:
+                count = 1
+                for segment in segments:
+                    start = format_timestamp(segment.start)
+                    end = format_timestamp(segment.end)
+                    text = segment.text.strip()
+                    
+                    # Wypisz w konsoli (żebyś wiedział że żyje)
+                    print(f"   -> {text}")
+                    
+                    f.write(f"{count}\n")
+                    f.write(f"{start} --> {end}\n")
+                    f.write(f"{text}\n\n")
+                    count += 1
+            
+            duration = int(time.time() - start_time)
+            print(f"✅ Gotowe w {duration}s. Zapisano: {srt_sciezka}")
 
-    srt_file = os.path.splitext(video_path)[0] + ".srt"
-    generate_srt(result, srt_file)
-    
-    if os.path.exists(audio_path): os.remove(audio_path)
-    print(f"✨ GOTOWE! Czas: {int(end_time - start_time)}s. Plik: {srt_file}")
+        except Exception as e:
+            print(f"❌ Błąd przy pliku {plik}: {e}")
+
+    print("\n✨ WSZYSTKIE ZADANIA UKOŃCZONE! ✨")
 
 if __name__ == "__main__":
-    PLIK = "Wojciech Cejrowski i woda gazowana [HBfpyArVyOI].mp4"
-    run_gpu_medium(PLIK)
+    process_folder()
