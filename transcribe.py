@@ -1,40 +1,84 @@
-import stable_whisper
-import torch_directml
 import os
+import torch
+from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+from transformers import AutoProcessor, pipeline
+from datetime import timedelta
 
-def run_on_amd(video_path):
+def format_timestamp(seconds):
+    """Zamienia sekundy na format SRT (00:00:00,000)"""
+    td = timedelta(seconds=seconds)
+    # timedelta może zwrócić dni, musimy to obsłużyć
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    millis = int(td.microseconds / 1000)
+    return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
+def generate_srt(result, output_file):
+    """Tworzy plik SRT z wyników pipeline'u"""
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i, chunk in enumerate(result["chunks"], start=1):
+            # Czasem pipeline zwraca timestampy jako tuple (start, end)
+            start, end = chunk["timestamp"]
+            
+            # Zabezpieczenie na wypadek braku końca timestampu (ostatnie zdanie)
+            if end is None:
+                end = start + 2.0 # Dajemy domyślnie 2 sekundy
+                
+            text = chunk["text"].strip()
+            
+            f.write(f"{i}\n")
+            f.write(f"{format_timestamp(start)} --> {format_timestamp(end)}\n")
+            f.write(f"{text}\n\n")
+
+def run_onnx_amd(video_path):
     if not os.path.exists(video_path):
         print("❌ Brak pliku!")
         return
 
-    print(f"--- START NA GPU AMD (Radeon): {video_path} ---")
-
-    # 1. Konfiguracja DirectML
+    print(f"--- START NA AMD (ONNX DirectML): {video_path} ---")
+    
+    model_id = "openai/whisper-large-v2"
+    
+    print("1. Ładowanie i konwersja modelu na ONNX (to zajmie chwilę za pierwszym razem)...")
+    
     try:
-        dml = torch_directml.device()
-        print("✅ Wykryto GPU AMD przez DirectML.")
-    except:
-        print("❌ Błąd: Nie wykryto DirectML. Upewnij się, że masz Python 3.10.")
+        # To jest kluczowy moment. export=True konwertuje model na format zrozumiały dla AMD.
+        # provider="DmlExecutionProvider" wymusza użycie Radeona.
+        model = ORTModelForSpeechSeq2Seq.from_pretrained(
+            model_id, 
+            export=True, 
+            provider="DmlExecutionProvider"
+        )
+        processor = AutoProcessor.from_pretrained(model_id)
+    except Exception as e:
+        print(f"❌ Błąd ładowania modelu: {e}")
         return
 
-    # 2. Ładowanie modelu
-    # Masz 16GB VRAM, więc 'large-v2' wejdzie bez problemu.
-    # Jest dużo dokładniejszy niż medium.
-    print("1. Ładowanie modelu large-v2 do VRAM...")
-    model = stable_whisper.load_model('large-v2', device=dml)
+    print("2. Uruchamianie pipeline'u na GPU...")
+    # Tworzymy potok przetwarzania
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        return_timestamps=True,
+        chunk_length_s=30,
+        stride_length_s=[6, 0]
+    )
 
-    # 3. Transkrypcja
-    print("2. Rozpoznawanie mowy...")
-    # WAŻNE: fp16=False. Karty AMD na Windows przez DirectML często
-    # wyrzucają błędy przy FP16. FP32 (False) jest stabilne.
-    result = model.transcribe(video_path, language='pl', vad=True, fp16=False)
+    print("3. Rozpoznawanie mowy (Transkrypcja)...")
+    # generate_kwargs wymusza język polski
+    result = pipe(video_path, generate_kwargs={"language": "polish"})
 
-    # 4. Zapis
+    # 4. Zapis do SRT
     srt_file = os.path.splitext(video_path)[0] + ".srt"
-    result.to_srt_vtt(srt_file, word_level=False)
-    print(f"✨ GOTOWE! Zapisano: {srt_file}")
+    print(f"4. Zapisywanie napisów do: {srt_file}")
+    
+    generate_srt(result, srt_file)
+    print("✨ GOTOWE! Sprawdź plik .srt")
 
 if __name__ == "__main__":
-    # Wpisz nazwę pliku
-    PLIK = "videos/WorldOfTanks_replay_2025.11.11-22.58.mp4" 
-    run_on_amd(PLIK)
+    PLIK = "WorldOfTanks_replay_2025.11.11-22.58.mp4"
+    run_onnx_amd(PLIK)
